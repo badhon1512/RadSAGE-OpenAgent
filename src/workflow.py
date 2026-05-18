@@ -167,7 +167,9 @@ def initialize_backend(args):
     from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor
 
     ensure_base_agent()
-    provider = args.provider or infer_provider(args.model_name)
+    # vLLM is accessed through an OpenAI-compatible API, so do not infer provider
+    # from model family names such as Llama. For local loading, keep inference.
+    provider = args.provider or ("gpt" if getattr(args, "use_vllm", False) else infer_provider(args.model_name))
     model_name = normalize_model_name(args.model_name, provider)
     hf_token = args.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
     device = "cuda" if torch.cuda.is_available() else "cpu"
