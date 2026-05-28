@@ -398,7 +398,15 @@ def process_csv(args):
 
     if args.resume:
         existing_df, completed_ids = load_existing_output(output_csv, args.id_column)
-        records = existing_df.to_dict("records") if not existing_df.empty else []
+        if not existing_df.empty and "status" in existing_df.columns:
+            ok_mask = existing_df["status"].fillna("").astype(str).str.lower().eq("ok")
+            retry_ids = set(existing_df.loc[~ok_mask, args.id_column].astype(str))
+            records = existing_df.loc[ok_mask].to_dict("records")
+        else:
+            retry_ids = set()
+            records = existing_df.to_dict("records") if not existing_df.empty else []
+        if retry_ids:
+            print(f"[resume] Preserved {len(completed_ids)} ok rows; retrying {len(retry_ids)} error/incomplete rows.")
     else:
         records, completed_ids = [], set()
         if output_csv.exists():

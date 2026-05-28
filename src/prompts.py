@@ -276,6 +276,7 @@ unsupported_findings — remove each listed finding from CURRENT:
 - Use only the allowed section headers listed above.
 - After all edits, delete any section that has no findings left.
 - Never output an empty section header.
+- A section header is valid only if it is followed by at least one bullet clinical finding; otherwise remove that header.
 - Never write placeholder findings such as "No findings", "No findings.", "(No findings)",
   "Empty", "(Empty)", "None", or "N/A".
 - Never describe the edits you made. Do not write reasons, notes, caveats, instructions,
@@ -332,6 +333,7 @@ duplicate_findings — remove the duplicate copy:
 - Use only the allowed section headers listed above.
 - After all edits, delete any section that has no findings left.
 - Never output an empty section header.
+- A section header is valid only if it is followed by at least one bullet clinical finding; otherwise remove that header.
 - Never create sections just to show that they are empty or normal.
 - Never write placeholder findings such as "No findings", "No findings.", "(No findings)",
   "Empty", "(Empty)", "None", or "N/A".
@@ -402,6 +404,7 @@ duplicate_findings — remove the duplicate copy:
 - Use only the allowed section headers listed above.
 - After all edits, remove any section that has no findings left.
 - Never output an empty section header.
+- A section header is valid only if it is followed by at least one bullet clinical finding; otherwise remove that header.
 - Do not change any finding that is not mentioned in the feedback.
 - If anatomy header already exists, add findings to it. If it does not exist, create it.
 - After removing the findings, if an anatomy header has no findings left, remove that header as well.

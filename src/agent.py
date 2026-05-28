@@ -157,12 +157,42 @@ def call_gemma(prompt: str) -> str:
     return res.get("content", "").strip()
 
 
-_FINDINGS_RE = _re.compile(r'(\*{0,2}FINDINGS\b.*)', _re.IGNORECASE | _re.DOTALL)
+_FINDINGS_HEADER_RE = _re.compile(
+    r'^[ \t]*(?:#{1,6}[ \t]*)?(?:\*\*)?FINDINGS(?:\*\*)?[ \t]*:?[ \t]*(?:\*\*)?[ \t]*$',
+    _re.IGNORECASE | _re.MULTILINE,
+)
+_SECTION_HEADER_RE = _re.compile(
+    r'^[ \t]*(?:#{1,6}[ \t]*)?(?:\*\*)?'
+    r'(?:Lungs and Airways|Pleura|Cardiovascular|Hila and Mediastinum|'
+    r'Tubes, Catheters, and Support Devices|Musculoskeletal and Chest Wall|'
+    r'Abdominal|Other)'
+    r'(?:\*\*)?[ \t]*:?[ \t]*(?:\*\*)?[ \t]*$',
+    _re.IGNORECASE | _re.MULTILINE,
+)
 
 def extract_findings_section(text: str) -> str:
-    """Strip any preamble before FINDINGS — keeps output clean when small models echo the prompt template."""
-    m = _FINDINGS_RE.search(text)
-    return m.group(1).strip() if m else text.strip()
+    """Remove preamble; if given candidate JSON, extract its report field first."""
+    if not isinstance(text, str):
+        return ""
+    stripped = text.strip()
+
+    if stripped.startswith("{"):
+        try:
+            parsed = json.loads(stripped)
+            report = parsed.get("report")
+            if isinstance(report, str):
+                stripped = report.strip()
+        except json.JSONDecodeError:
+            pass
+
+    findings_match = _FINDINGS_HEADER_RE.search(stripped)
+    section_match = _SECTION_HEADER_RE.search(stripped)
+
+    if findings_match and (not section_match or findings_match.start() <= section_match.start()):
+        return stripped[findings_match.start():].strip()
+    if section_match:
+        return stripped[section_match.start():].strip()
+    return stripped
 
 
 def call_gpt_chat(messages: list) -> str:

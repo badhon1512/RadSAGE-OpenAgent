@@ -1,9 +1,16 @@
 import argparse
 import json
+import re
 import time
 from pathlib import Path
 
 import workflow
+
+
+ORCHESTRATOR_HISTORY_TURNS = 5
+MAX_HISTORY_MESSAGE_CHARS = 400
+MAX_EMERGENCY_USER_MESSAGE_CHARS = 60000
+MAX_CONTEXT_RETRY_REPORT_WORDS = 1200
 
 
 VALID_ACTIONS = {
@@ -13,6 +20,155 @@ VALID_ACTIONS = {
     "select_best_candidate",
     "finalize_report",
 }
+
+
+def is_context_length_error(exc):
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "maximum context length",
+            "context length",
+            "input_tokens",
+            "max_model_len",
+            "too many tokens",
+        )
+    )
+
+
+def compact_text(text: str, max_chars: int) -> str:
+    if not isinstance(text, str) or len(text) <= max_chars:
+        return text
+    keep = max_chars // 2
+    return (
+        text[:keep].rstrip()
+        + "\n\n[... middle omitted to fit model context ...]\n\n"
+        + text[-keep:].lstrip()
+    )
+
+
+def compact_history_message(message: dict, max_chars: int = MAX_HISTORY_MESSAGE_CHARS) -> dict:
+    content = message.get("content", "")
+    if message.get("role") != "user" or not isinstance(content, str):
+        return message
+    return {**message, "content": compact_text(content, max_chars)}
+
+
+def trim_report_for_context_retry(report: str, label: str = "report") -> str:
+    if not isinstance(report, str):
+        return report
+    words = report.split()
+    if len(words) <= MAX_CONTEXT_RETRY_REPORT_WORDS:
+        return report
+    print(
+        f"[warn] {label} has {len(words)} words after token-limit failure; "
+        f"retrying with first {MAX_CONTEXT_RETRY_REPORT_WORDS} words."
+    )
+    return " ".join(words[:MAX_CONTEXT_RETRY_REPORT_WORDS]).strip()
+
+
+def call_findings_judge_with_context_retry(free_text: str, report: str):
+    prompt = workflow.base_agent.build_findings_judge_prompt(free_text, report)
+    try:
+        feedback, raw = workflow.call_json_judge(prompt, workflow.EMPTY_FINDINGS_FEEDBACK)
+        return feedback, raw, prompt, report
+    except Exception as exc:
+        if not is_context_length_error(exc):
+            raise
+        retry_report = trim_report_for_context_retry(report, "findings judge report")
+        retry_prompt = workflow.base_agent.build_findings_judge_prompt(free_text, retry_report)
+        feedback, raw = workflow.call_json_judge(retry_prompt, workflow.EMPTY_FINDINGS_FEEDBACK)
+        return feedback, raw, retry_prompt, retry_report
+
+
+def call_anatomy_judge_with_context_retry(report: str):
+    prompt = workflow.base_agent.build_anatomy_duplication_judge_prompt(report)
+    try:
+        feedback, raw = workflow.call_json_judge(prompt, workflow.EMPTY_ANATOMY_FEEDBACK)
+        return feedback, raw, prompt, report
+    except Exception as exc:
+        if not is_context_length_error(exc):
+            raise
+        retry_report = trim_report_for_context_retry(report, "anatomy judge report")
+        retry_prompt = workflow.base_agent.build_anatomy_duplication_judge_prompt(retry_report)
+        feedback, raw = workflow.call_json_judge(retry_prompt, workflow.EMPTY_ANATOMY_FEEDBACK)
+        return feedback, raw, retry_prompt, retry_report
+
+
+def call_llm_with_report_context_retry(prompt_builder, report: str, label: str):
+    prompt = prompt_builder(report)
+    try:
+        return workflow.base_agent.call_llm(prompt).strip(), prompt, report
+    except Exception as exc:
+        if not is_context_length_error(exc):
+            raise
+        retry_report = trim_report_for_context_retry(report, label)
+        retry_prompt = prompt_builder(retry_report)
+        return workflow.base_agent.call_llm(retry_prompt).strip(), retry_prompt, retry_report
+
+
+def trim_candidates_for_context_retry(candidates):
+    trimmed = []
+    for idx, candidate in enumerate(candidates, start=1):
+        report = candidate.get("report", "")
+        trimmed.append({
+            **candidate,
+            "report": trim_report_for_context_retry(report, f"selection candidate {idx}"),
+        })
+    return trimmed
+
+
+def call_selection_with_context_retry(free_text: str, candidates):
+    prompt = workflow.build_revision_selection_prompt(free_text, candidates)
+    try:
+        return workflow.base_agent.call_llm(prompt).strip(), prompt, candidates
+    except Exception as exc:
+        if not is_context_length_error(exc):
+            raise
+        print("[warn] Selection prompt exceeded model limit; retrying with trimmed candidate reports.")
+        retry_candidates = trim_candidates_for_context_retry(candidates)
+        retry_prompt = workflow.build_revision_selection_prompt(free_text, retry_candidates)
+        return workflow.base_agent.call_llm(retry_prompt).strip(), retry_prompt, retry_candidates
+
+
+REVISION_LABEL_RE = re.compile(r"^orchestrator_revision_(\d+)\.?$", re.IGNORECASE)
+
+
+def resolve_selected_report(selected: str, candidates) -> str:
+    """Resolve selection labels like orchestrator_revision_6 to the actual candidate report."""
+    if not isinstance(selected, str):
+        return ""
+    text = selected.strip()
+
+    if text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+            report = parsed.get("report")
+            if isinstance(report, str) and report.strip():
+                return report.strip()
+            stage = parsed.get("stage")
+            if isinstance(stage, str):
+                text = stage.strip()
+        except json.JSONDecodeError:
+            pass
+
+    label = text.strip().strip('`').strip().rstrip(".")
+    for candidate in candidates:
+        if label == candidate.get("stage"):
+            return candidate.get("report", text)
+
+    match = REVISION_LABEL_RE.match(label)
+    if match:
+        stage = f"orchestrator_revision_{int(match.group(1))}"
+        for candidate in candidates:
+            if candidate.get("stage") == stage:
+                return candidate.get("report", text)
+
+    if label.lower() == "initial" and candidates:
+        return candidates[0].get("report", text)
+
+    return text
+
 
 
 def build_orchestrator_system_prompt(mute_findings: bool = False, mute_anatomy: bool = False):
@@ -203,7 +359,7 @@ def feedback_has_issues(findings_feedback, anatomy_feedback):
     return workflow.has_actionable_feedback(findings_feedback, anatomy_feedback)
 
 
-# ── Human-friendly logging helpers ────────────────────────────────────────────
+# logging helpers 
 
 _W = 60  # line width for separators
 
@@ -216,7 +372,7 @@ def _sep(title=""):
 
 def _print_report(report: str):
     print(report)
-    print("─" * _W)
+    print("" * _W)
 
 def _print_decision(tool_call, max_tool_calls, requested, final, certainty, reason, used_fallback):
     icon = "⚠" if used_fallback else "▶"
@@ -293,7 +449,7 @@ def run_orchestrator_agent_pipeline(
     if ablation_label != "all_judges":
         print(f"[ablation] Muted judges: {ablation_label}")
 
-    # ── Step 0: Initial structuring ───────────────────────────────────────────
+    # Step 0: Initial structuring
     structuring_prompt = workflow.base_agent.build_structuring_prompt(free_text)
     current_report = workflow.base_agent.call_llm(structuring_prompt).strip()
     prompt_log.append({
@@ -354,9 +510,28 @@ def run_orchestrator_agent_pipeline(
             mute_findings=mute_findings_judge,
             mute_anatomy=mute_anatomy_judge,
         )
-        messages.append({"role": "user", "content": user_msg})
-        raw_response = workflow.base_agent.call_llm_chat(messages)
-        messages.append({"role": "assistant", "content": raw_response})
+        turn_messages = [*messages, {"role": "user", "content": user_msg}]
+        try:
+            raw_response = workflow.base_agent.call_llm_chat(turn_messages)
+        except Exception as exc:
+            if not is_context_length_error(exc):
+                raise
+            print(
+                "[warn] Orchestrator context exceeded model limit; "
+                "retrying with system prompt and current state only."
+            )
+            turn_messages = [messages[0], {"role": "user", "content": user_msg}]
+            try:
+                raw_response = workflow.base_agent.call_llm_chat(turn_messages)
+            except Exception as current_exc:
+                if not is_context_length_error(current_exc):
+                    raise
+                print("[warn] Current state still exceeded context; truncating current state message.")
+                compact_user_msg = compact_text(user_msg, MAX_EMERGENCY_USER_MESSAGE_CHARS)
+                turn_messages = [messages[0], {"role": "user", "content": compact_user_msg}]
+                raw_response = workflow.base_agent.call_llm_chat(turn_messages)
+
+        messages = [*turn_messages, {"role": "assistant", "content": raw_response}]
 
         requested_action, requested_reason, certainty = parse_orchestrator_action(raw_response)
         action, reason = requested_action, requested_reason
@@ -398,7 +573,7 @@ def run_orchestrator_agent_pipeline(
         # Log orchestrator turn (messages_sent = all messages that were sent, i.e. before appending assistant)
         prompt_log.append({
             "step": tool_call, "agent": "orchestrator", "tool_call": tool_call,
-            "messages_sent": messages[:-1],  # excludes the assistant reply we just got
+            "messages_sent": turn_messages,
             "response": raw_response,
             "parsed_action": action,
             "requested_action": requested_action,
@@ -416,10 +591,11 @@ def run_orchestrator_agent_pipeline(
         _print_decision(tool_call, max_tool_calls, requested_action, action, certainty, reason, used_fallback)
         _print_raw("Orchestrator", raw_response)
 
-        # ── Execute the chosen action ──────────────────────────────────────────
+        #  Execute the chosen action 
         if action == "run_findings_judge":
-            judge_prompt = workflow.base_agent.build_findings_judge_prompt(free_text, current_report)
-            feedback, findings_raw = workflow.call_json_judge(judge_prompt, workflow.EMPTY_FINDINGS_FEEDBACK)
+            feedback, findings_raw, judge_prompt, _judge_input_report = call_findings_judge_with_context_retry(
+                free_text, current_report,
+            )
             findings_feedback = workflow.normalize_findings_feedback(feedback)
             findings_judge_calls += 1
             findings_ran_since_revision = True
@@ -439,8 +615,7 @@ def run_orchestrator_agent_pipeline(
             _print_raw("Findings judge", findings_raw)
 
         elif action == "run_anatomy_judge":
-            judge_prompt = workflow.base_agent.build_anatomy_duplication_judge_prompt(current_report)
-            feedback, anatomy_raw = workflow.call_json_judge(judge_prompt, workflow.EMPTY_ANATOMY_FEEDBACK)
+            feedback, anatomy_raw, judge_prompt, _judge_input_report = call_anatomy_judge_with_context_retry(current_report)
             anatomy_feedback = workflow.normalize_anatomy_feedback(feedback)
             anatomy_judge_calls += 1
             anatomy_ran_since_revision = True
@@ -470,10 +645,13 @@ def run_orchestrator_agent_pipeline(
             )
             intermediate = current_report
             if has_findings:
-                findings_rev_prompt = workflow.base_agent.build_findings_revision_prompt(
-                    free_text, current_report, findings_feedback,
+                intermediate, findings_rev_prompt, _findings_input_report = call_llm_with_report_context_retry(
+                    lambda report: workflow.base_agent.build_findings_revision_prompt(
+                        free_text, report, findings_feedback,
+                    ),
+                    current_report,
+                    "findings revision input report",
                 )
-                intermediate = workflow.base_agent.call_llm(findings_rev_prompt).strip()
                 prompt_log.append({
                     "step": tool_call, "agent": "revision_findings", "tool_call": tool_call,
                     "prompt": findings_rev_prompt,
@@ -482,10 +660,13 @@ def run_orchestrator_agent_pipeline(
                 _sep("After Findings Revision")
                 _print_report(intermediate)
             if has_anatomy:
-                anatomy_rev_prompt = workflow.base_agent.build_anatomy_revision_prompt(
-                    intermediate, anatomy_feedback,
+                intermediate, anatomy_rev_prompt, _anatomy_input_report = call_llm_with_report_context_retry(
+                    lambda report: workflow.base_agent.build_anatomy_revision_prompt(
+                        report, anatomy_feedback,
+                    ),
+                    intermediate,
+                    "anatomy revision input report",
                 )
-                intermediate = workflow.base_agent.call_llm(anatomy_rev_prompt).strip()
                 prompt_log.append({
                     "step": tool_call, "agent": "revision_anatomy", "tool_call": tool_call,
                     "prompt": anatomy_rev_prompt,
@@ -496,10 +677,13 @@ def run_orchestrator_agent_pipeline(
             revised_report = intermediate
             if not has_findings and not has_anatomy:
                 # Fallback: no actionable feedback — use combined prompt to avoid a no-op
-                fallback_prompt = workflow.base_agent.build_revision_prompt(
-                    free_text, current_report, findings_feedback, anatomy_feedback,
+                revised_report, fallback_prompt, _revision_input_report = call_llm_with_report_context_retry(
+                    lambda report: workflow.base_agent.build_revision_prompt(
+                        free_text, report, findings_feedback, anatomy_feedback,
+                    ),
+                    current_report,
+                    "fallback revision input report",
                 )
-                revised_report = workflow.base_agent.call_llm(fallback_prompt).strip()
                 prompt_log.append({
                     "step": tool_call, "agent": "revision", "tool_call": tool_call,
                     "prompt": fallback_prompt,
@@ -521,16 +705,17 @@ def run_orchestrator_agent_pipeline(
             _print_report(current_report)
 
         elif action == "select_best_candidate":
-            selection_prompt = workflow.build_revision_selection_prompt(free_text, candidates)
-            selected = workflow.base_agent.call_llm(selection_prompt).strip()
+            selected, selection_prompt, selection_candidates = call_selection_with_context_retry(
+                free_text, candidates,
+            )
             prompt_log.append({
                 "step": tool_call, "agent": "selection", "tool_call": tool_call,
                 "prompt": selection_prompt,
                 "response": selected,
-                "candidates_count": len(candidates),
+                "candidates_count": len(selection_candidates),
             })
             if selected:
-                current_report = selected
+                current_report = resolve_selected_report(selected, selection_candidates)
                 selection_calls += 1
                 stop_reason = "selected_final"
                 _sep("Selected Best Candidate")
@@ -543,23 +728,24 @@ def run_orchestrator_agent_pipeline(
 
     if stop_reason == "max_tool_calls" and select_final and len(candidates) > 1:
         print("\n  ℹ Max tool calls reached — selecting best candidate.")
-        selection_prompt = workflow.build_revision_selection_prompt(free_text, candidates)
-        selected = workflow.base_agent.call_llm(selection_prompt).strip()
+        selected, selection_prompt, selection_candidates = call_selection_with_context_retry(
+            free_text, candidates,
+        )
         prompt_log.append({
             "step": tool_calls_used, "agent": "selection_budget_exhausted", "tool_call": tool_calls_used,
             "prompt": selection_prompt,
             "response": selected,
-            "candidates_count": len(candidates),
+            "candidates_count": len(selection_candidates),
         })
         if selected:
-            current_report = selected
+            current_report = resolve_selected_report(selected, selection_candidates)
             selection_calls += 1
             stop_reason = "max_tool_calls_selected_final"
             _sep("Selected Best Candidate (budget exhausted)")
             _print_report(current_report)
 
     metadata = {
-        # ── core counters ──────────────────────────────────────────────────────
+        #  core counters 
         "tool_calls_used":       tool_calls_used,
         "revision_rounds_used":  revision_rounds_used,
         "findings_judge_calls":  findings_judge_calls,
@@ -569,19 +755,19 @@ def run_orchestrator_agent_pipeline(
         "fallback_count":        fallback_count,
         "stop_reason":           stop_reason,
         "ablation_muted_judges": ablation_label,
-        # ── action sequences ───────────────────────────────────────────────────
+        #  action sequences 
         "action_sequence":           "|".join(e["action"]            for e in trace_events),
         "requested_action_sequence": "|".join(e["requested_action"]  for e in trace_events),
         "certainty_sequence":        "|".join(certainty_sequence),
-        # ── report snapshots ───────────────────────────────────────────────────
+        #  report snapshots 
         "initial_report":    candidates[0]["report"],
         "final_report":      current_report,
         "candidates_json":   json.dumps(candidates, ensure_ascii=False),
         "revision_reports_json": json.dumps(revision_reports, ensure_ascii=False),
-        # ── feedback histories ─────────────────────────────────────────────────
+        #  feedback histories 
         "findings_feedback_history_json": json.dumps(findings_feedback_history, ensure_ascii=False),
         "anatomy_feedback_history_json":  json.dumps(anatomy_feedback_history,  ensure_ascii=False),
-        # ── full trace ─────────────────────────────────────────────────────────
+        #  full trace 
         "trace_json": json.dumps(trace_events, ensure_ascii=False),
     }
     for action_name in sorted(VALID_ACTIONS):
@@ -722,11 +908,41 @@ def process_csv(args):
 
     if args.resume:
         existing_df, completed_ids = workflow.load_existing_output(output_csv, args.id_column)
-        records       = existing_df.to_dict("records") if not existing_df.empty else []
-        existing_stats_df, _ = workflow.load_existing_output(stats_csv, args.id_column)
-        stats_records = existing_stats_df.to_dict("records") if not existing_stats_df.empty else []
-        jsonl_mode    = "a"
-        prompts_dict  = json.loads(prompts_json.read_text(encoding="utf-8")) if prompts_json.exists() else {}
+        existing_stats_df, _       = workflow.load_existing_output(stats_csv, args.id_column)
+
+        # Keep only ok rows; error/incomplete rows will be retried and their old
+        # entries must be removed from every output file to avoid duplicates.
+        if not existing_df.empty and "status" in existing_df.columns:
+            ok_mask   = existing_df["status"].fillna("").astype(str).str.lower().eq("ok")
+            retry_ids = set(existing_df.loc[~ok_mask, args.id_column].astype(str))
+            records   = existing_df.loc[ok_mask].to_dict("records")
+            completed_ids = set(existing_df.loc[ok_mask, args.id_column].astype(str))
+        else:
+            retry_ids = set()
+            records   = existing_df.to_dict("records") if not existing_df.empty else []
+            completed_ids = set(str(r[args.id_column]) for r in records if args.id_column in r)
+
+        if not existing_stats_df.empty and "status" in existing_stats_df.columns:
+            stat_ok_mask  = existing_stats_df["status"].fillna("").astype(str).str.lower().eq("ok")
+            stats_records = existing_stats_df.loc[stat_ok_mask].to_dict("records")
+        else:
+            stats_records = existing_stats_df.to_dict("records") if not existing_stats_df.empty else []
+
+        prompts_dict = json.loads(prompts_json.read_text(encoding="utf-8")) if prompts_json.exists() else {}
+        for rid in retry_ids:
+            prompts_dict.pop(rid, None)
+
+        # Rewrite JSONL without error-row lines so retried rows don't appear twice.
+        if retry_ids and prompts_jsonl.exists():
+            kept = [
+                line for line in prompts_jsonl.read_text(encoding="utf-8").splitlines()
+                if line.strip() and str(json.loads(line).get(args.id_column)) not in retry_ids
+            ]
+            prompts_jsonl.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+
+        jsonl_mode = "a"
+        if retry_ids:
+            print(f"[resume] Preserved {len(completed_ids)} ok rows; retrying {len(retry_ids)} error/incomplete rows.")
     else:
         # Fresh start — clear all existing output files
         records, stats_records, completed_ids = [], [], set()
